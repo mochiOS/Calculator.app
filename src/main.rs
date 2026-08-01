@@ -1,3 +1,4 @@
-fn main() {
-    println!("Hello, world!");
-}
+mod calc;
+mod ast;
+
+fn main() {}
