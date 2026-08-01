@@ -1,3 +1,5 @@
+mod calclator;
+
 use viewkit::prelude::*;
 
 struct HelloWorldApp;

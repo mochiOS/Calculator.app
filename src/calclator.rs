@@ -110,6 +110,13 @@ pub fn parse(source: &str) -> Result<Expression, CalculatorError> {
     Parser::new(tokens).parse()
 }
 
+/// 計算式を入力すると解を返します。
+///
+/// ### Args
+/// - `source: &str`: 計算式
+///
+/// ### Returns
+/// 成功時は解（`f64`）を返し、失敗時は `CalculatorError` を返します
 pub fn evaluate(source: &str) -> Result<f64, CalculatorError> {
     let expression = parse(source)?;
     let value = evaluate_expression(&expression)?;
