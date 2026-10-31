@@ -1,3 +1,4 @@
+mod native;
 use crate::engine::{self, Mode, Settings, Value};
 use crate::{
     editing,
@@ -13,6 +14,7 @@ use appcore::viewkit::event::{
 use appcore::viewkit::platform::Key;
 use appcore::viewkit::view::{Constraints, MeasureContext, PaintContext};
 use appcore::viewkit::{close_window, request_new_window};
+use native::ToolbarAction;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -25,6 +27,7 @@ enum Action {
     ClearEntry,
     Function(&'static str),
     More,
+    Modes,
     Undo,
     Redo,
     CopyExpression,
@@ -64,14 +67,12 @@ struct Model {
     error: Option<String>,
     status: Option<String>,
     history: Vec<History>,
-    scroll: f32,
     category: usize,
     from: usize,
     to: usize,
     preview: Option<(String, Settings, usize, usize, usize)>,
 }
 struct Pickers {
-    mode: Picker,
     base: Picker,
     bits: Picker,
     category: Picker,
@@ -107,6 +108,10 @@ struct Core {
     clear_history: Button,
     swap: Button,
     history_buttons: RefCell<BTreeMap<usize, ButtonInteractionState>>,
+    history_scroll: ScrollState,
+    toolbar: ActionToolbarState<ToolbarAction>,
+    history_toolbar: ActionToolbarState<ToolbarAction>,
+    mode_button: ButtonInteractionState,
 }
 #[derive(Clone)]
 pub struct CalculatorView {
@@ -149,13 +154,6 @@ fn action_button(label: &str, action: Action, pending: &Rc<Cell<Option<Action>>>
         .on_click(move || pending.set(Some(action)))
 }
 fn pickers(model: &Model, action: &Rc<Cell<Option<Action>>>) -> Pickers {
-    let mut mode = Picker::new(model.settings.mode.label());
-    for choice in Mode::ALL {
-        let pending = action.clone();
-        mode = mode.option(choice.label(), move || {
-            pending.set(Some(Action::Mode(choice)))
-        });
-    }
     let mut base = Picker::new(match model.settings.base {
         2 => "BIN",
         8 => "OCT",
@@ -188,7 +186,6 @@ fn pickers(model: &Model, action: &Rc<Cell<Option<Action>>>) -> Pickers {
         to = to.option(unit.name, move || pending.set(Some(Action::To(i))));
     }
     Pickers {
-        mode,
         base,
         bits,
         category,
@@ -306,21 +303,31 @@ fn keys(
                 label,
             )
             .on_click(move || pending.set(Some(a)))
+            .accessibility_label(label)
+            .content_padding(false)
+            .content(
+                HStack::new()
+                    .alignment(StackAlignment::Center)
+                    .distribution(StackDistribution::Center)
+                    .gap(StackGap::None)
+                    .child(
+                        Text::styled(
+                            label,
+                            if model.settings.mode == Mode::Programmer && label.len() > 1 {
+                                TextRole::Label
+                            } else {
+                                TextRole::Body
+                            },
+                        )
+                        .single_line(true),
+                    ),
+            )
             .size(ButtonSize::Large)
+            .shadow(ShadowStyle::None)
             .style(if matches!(a, Action::Equals) {
                 ButtonStyle::Accent
             } else {
-                if matches!(
-                    a,
-                    Action::Insert("+" | "-" | "*" | "/" | "%")
-                        | Action::ClearEntry
-                        | Action::Negate
-                        | Action::Function(_)
-                ) {
-                    ButtonStyle::Primary
-                } else {
-                    ButtonStyle::Standard
-                }
+                ButtonStyle::Standard
             })
             .enabled(enabled);
             if matches!(a, Action::Back) {
@@ -372,7 +379,6 @@ impl CalculatorView {
             error: error.or(history_error),
             status: None,
             history: saved_history,
-            scroll: 0.0,
             category: 0,
             from: 0,
             to: 1,
@@ -431,6 +437,10 @@ impl CalculatorView {
                 clear_history,
                 swap,
                 history_buttons: RefCell::new(BTreeMap::new()),
+                history_scroll: ScrollState::new(),
+                toolbar: ActionToolbarState::new(),
+                history_toolbar: ActionToolbarState::new(),
+                mode_button: ButtonInteractionState::new(),
             }),
             history_only: false,
         }
@@ -779,11 +789,31 @@ impl CalculatorView {
                 m.result = None;
                 m.error = None;
             }
+            Action::Modes => {
+                let position = self.toolbar_anchor(ToolbarAction::Modes, frames, context);
+                self.core
+                    .menu_id
+                    .set(self.core.menu_id.get().wrapping_add(1));
+                *self.core.menu.borrow_mut() = Mode::ALL.into_iter().map(Action::Mode).collect();
+                context.show_context_menu(ContextMenuRequest {
+                    request_id: self.core.menu_id.get(),
+                    position,
+                    items: Mode::ALL
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, mode)| ContextMenuItem {
+                            command_id: i as u32,
+                            label: mode.label().into(),
+                            enabled: true,
+                            checked: mode == self.current_settings().mode,
+                            destructive: false,
+                            separator: false,
+                        })
+                        .collect(),
+                });
+            }
             Action::More => self.show_menu(
-                Point::new(
-                    frames.toolbar_button(2).origin.x,
-                    frames.toolbar.origin.y + frames.toolbar.size.height,
-                ),
+                self.toolbar_anchor(ToolbarAction::More, frames, context),
                 None,
                 context,
             ),
@@ -811,7 +841,7 @@ impl CalculatorView {
                 if row < model.history.len() {
                     model.history.remove(row);
                 }
-                model.scroll = 0.0;
+                self.core.history_scroll.reset();
                 self.core.history_buttons.borrow_mut().clear();
                 drop(model);
                 self.persist_history();
@@ -905,7 +935,7 @@ impl CalculatorView {
                 let mut model = self.core.model.borrow_mut();
                 model.history.clear();
                 model.history_writable = true;
-                model.scroll = 0.0;
+                self.core.history_scroll.reset();
                 self.core.history_buttons.borrow_mut().clear();
                 drop(model);
                 self.persist_history();
@@ -1050,6 +1080,18 @@ impl CalculatorView {
         ) {
             self.record_input(original);
         }
+        if !self.history_only
+            && !matches!(
+                action,
+                Action::Modes
+                    | Action::More
+                    | Action::History
+                    | Action::ClearHistory
+                    | Action::ConfirmClearHistory
+            )
+        {
+            context.request_keyboard_focus(frames.input);
+        }
         self.refresh_keys();
         self.changed();
         context.request_redraw_in(frames.bounds);
@@ -1060,74 +1102,91 @@ struct Frames {
     toolbar: Rect,
     input: Rect,
     result: Rect,
-    copy: Rect,
     context: Rect,
     keys: Rect,
     message: Rect,
+    gap: f32,
+    history_area: Rect,
 }
 impl Frames {
     fn new(bounds: Rect, theme: &Theme, mode: Mode) -> Self {
-        let _ = theme;
-        let x = bounds.origin.x + 12.0;
-        let w = (bounds.size.width - 24.0).max(0.0);
-        let toolbar = Rect::new(bounds.origin.x, bounds.origin.y, bounds.size.width, 40.0);
-        let input = Rect::new(x, bounds.origin.y + 48.0, w, 32.0);
-        let result = Rect::new(x, bounds.origin.y + 84.0, w, 48.0);
+        let margin = theme.spacing.medium;
+        let x = bounds.origin.x + margin;
+        let w = (bounds.size.width - margin * 2.0).max(0.0);
+        let toolbar = Rect::new(
+            bounds.origin.x,
+            bounds.origin.y,
+            bounds.size.width,
+            theme.layout.top_bar_height,
+        );
+        let input = Rect::new(
+            x,
+            toolbar.origin.y + toolbar.size.height + theme.spacing.small,
+            w,
+            theme.controls.height,
+        );
+        let result = Rect::new(
+            x,
+            input.origin.y + input.size.height + theme.spacing.extra_small,
+            w,
+            theme.layout.top_bar_height,
+        );
         let context = Rect::new(
             x,
-            bounds.origin.y + 142.0,
+            result.origin.y + result.size.height + theme.spacing.small,
             w,
             match mode {
-                Mode::Convert => 68.0,
+                Mode::Convert => theme.controls.height * 2.0 + theme.spacing.small,
                 Mode::Standard => 0.0,
-                _ => 28.0,
+                _ => theme.controls.height,
             },
         );
-        let y = context.origin.y + context.size.height + 12.0;
-        let bottom = bounds.origin.y + bounds.size.height - 30.0;
+        let y = context.origin.y + context.size.height + margin;
+        let footer = Rect::new(
+            bounds.origin.x,
+            bounds.origin.y + (bounds.size.height - theme.layout.status_bar_height).max(0.0),
+            bounds.size.width,
+            theme.layout.status_bar_height.min(bounds.size.height),
+        );
         Self {
             bounds,
             toolbar,
             input,
             result,
-            copy: Rect::new(x + w - 196.0, bounds.origin.y + 6.0, 52.0, 28.0),
             context,
-            keys: Rect::new(x, y, w, (bottom - y).max(0.0)),
-            message: Rect::new(x, bottom + 6.0, w, 20.0),
-        }
-    }
-    fn toolbar_button(&self, index: usize) -> Rect {
-        let x = self.toolbar.origin.x;
-        let w = self.toolbar.size.width;
-        let y = self.toolbar.origin.y + 6.0;
-        match index {
-            0 => Rect::new(x + 12.0, y, (w - 220.0).max(80.0), 28.0),
-            1 => Rect::new(x + w - 148.0, y, 76.0, 28.0),
-            _ => Rect::new(x + w - 68.0, y, 56.0, 28.0),
+            keys: Rect::new(x, y, w, (footer.origin.y - margin - y).max(0.0)),
+            message: footer,
+            gap: theme.spacing.extra_small,
+            history_area: Rect::new(
+                bounds.origin.x,
+                toolbar.origin.y + toolbar.size.height,
+                bounds.size.width,
+                (footer.origin.y - toolbar.origin.y - toolbar.size.height).max(0.0),
+            ),
         }
     }
     fn key(&self, index: usize, count: usize, mode: Mode) -> Rect {
         let mut area = self.keys;
         let mut index = index;
         if mode == Mode::Scientific {
-            let h = ((area.size.height - 7.0 * 6.0) / 7.0).max(0.0);
+            let h = ((area.size.height - 6.0 * self.gap) / 7.0).max(0.0);
             if index < 6 {
-                let w = ((area.size.width - 12.0) / 3.0).max(0.0);
+                let w = ((area.size.width - self.gap * 2.0) / 3.0).max(0.0);
                 return Rect::new(
-                    area.origin.x + (index % 3) as f32 * (w + 6.0),
-                    area.origin.y + (index / 3) as f32 * (h + 6.0),
+                    area.origin.x + (index % 3) as f32 * (w + self.gap),
+                    area.origin.y + (index / 3) as f32 * (h + self.gap),
                     w,
                     h,
                 );
             }
             index -= 6;
-            area.origin.y += 2.0 * (h + 6.0);
-            area.size.height = (area.size.height - 2.0 * (h + 6.0)).max(0.0);
+            area.origin.y += 2.0 * (h + self.gap);
+            area.size.height = (area.size.height - 2.0 * (h + self.gap)).max(0.0);
         }
         let columns = if mode == Mode::Programmer { 6 } else { 4 };
         let rows = if columns == 6 { count.div_ceil(6) } else { 5 };
-        let w = ((area.size.width - 6.0 * (columns - 1) as f32) / columns as f32).max(0.0);
-        let h = ((area.size.height - 6.0 * (rows - 1) as f32) / rows as f32).max(0.0);
+        let w = ((area.size.width - self.gap * (columns - 1) as f32) / columns as f32).max(0.0);
+        let h = ((area.size.height - self.gap * (rows - 1) as f32) / rows as f32).max(0.0);
         let (slot, span) = if columns == 4 && index >= 16 {
             (
                 index + usize::from(index > 16),
@@ -1137,50 +1196,18 @@ impl Frames {
             (index, 1.0)
         };
         Rect::new(
-            area.origin.x + (slot % columns) as f32 * (w + 6.0),
-            area.origin.y + (slot / columns) as f32 * (h + 6.0),
-            w * span + 6.0 * (span - 1.0),
+            area.origin.x + (slot % columns) as f32 * (w + self.gap),
+            area.origin.y + (slot / columns) as f32 * (h + self.gap),
+            w * span + self.gap * (span - 1.0),
             h,
         )
     }
+    #[cfg(test)]
     fn angle(&self) -> Rect {
-        Rect::new(
-            self.context.origin.x,
-            self.context.origin.y,
-            self.context.size.width.min(200.0),
-            28.0,
-        )
-    }
-    fn units(&self, index: usize) -> Rect {
-        let half = ((self.context.size.width - 76.0) / 2.0).max(0.0);
-        match index {
-            0 => Rect::new(
-                self.context.origin.x,
-                self.context.origin.y,
-                200.0_f32.min(self.context.size.width),
-                28.0,
-            ),
-            1 => Rect::new(
-                self.context.origin.x,
-                self.context.origin.y + 40.0,
-                half,
-                28.0,
-            ),
-            2 => Rect::new(
-                self.context.origin.x + half + 76.0,
-                self.context.origin.y + 40.0,
-                half,
-                28.0,
-            ),
-            _ => Rect::new(
-                self.context.origin.x + half + 8.0,
-                self.context.origin.y + 40.0,
-                60.0,
-                28.0,
-            ),
-        }
+        self.context
     }
 }
+
 impl View for CalculatorView {
     fn measure(&self, c: Constraints, _: &mut MeasureContext<'_>) -> Size {
         c.constrain(c.maximum)
@@ -1201,27 +1228,20 @@ impl View for CalculatorView {
         let model = self.core.model.borrow();
         let mut frames = Frames::new(bounds, context.theme, settings.mode);
         if self.history_only {
-            frames.keys = Rect::new(
-                bounds.origin.x + 12.0,
-                bounds.origin.y + 48.0,
-                (bounds.size.width - 24.0).max(0.0),
-                (bounds.size.height - 84.0).max(0.0),
-            );
+            frames.keys = frames.history_area;
         }
-        Rectangle::new()
-            .color(RectangleColor::Custom(context.theme.colors.background))
-            .paint(bounds, context);
+        Surface::sidebar().paint(bounds, context);
         let _ = self.core.revision.get();
         if !self.history_only {
-            self.core
-                .pickers
-                .borrow()
-                .mode
-                .paint(frames.toolbar_button(0), context);
-            self.core.history.paint(frames.toolbar_button(1), context);
-            self.core
-                .default_mode
-                .paint(frames.toolbar_button(2), context);
+            Surface::pane().paint(
+                Rect::new(
+                    bounds.origin.x,
+                    frames.input.origin.y - context.theme.spacing.small,
+                    bounds.size.width,
+                    frames.context.origin.y - frames.input.origin.y + context.theme.spacing.small,
+                ),
+                context,
+            );
             self.core.field.paint(frames.input, context);
             let label = model
                 .result
@@ -1270,96 +1290,14 @@ impl View for CalculatorView {
                     .paint(frames.result, context);
                 context.display_list.push(DrawCommand::PopClip);
             }
-            self.core.copy.paint(frames.copy, context);
-            match settings.mode {
-                Mode::Scientific => self.core.angle.paint(frames.angle(), context),
-                Mode::Programmer => {
-                    let pickers = self.core.pickers.borrow();
-                    pickers.base.paint(
-                        Rect::new(frames.context.origin.x, frames.context.origin.y, 92.0, 28.0),
-                        context,
-                    );
-                    pickers.bits.paint(
-                        Rect::new(
-                            frames.context.origin.x + 104.0,
-                            frames.context.origin.y,
-                            108.0,
-                            28.0,
-                        ),
-                        context,
-                    );
-                    self.core.signed_control.paint(
-                        Rect::new(
-                            frames.context.origin.x + 224.0,
-                            frames.context.origin.y,
-                            (frames.context.size.width - 224.0).max(0.0),
-                            28.0,
-                        ),
-                        context,
-                    );
-                }
-                Mode::Convert => {
-                    let pickers = self.core.pickers.borrow();
-                    pickers.category.paint(frames.units(0), context);
-                    pickers.from.paint(frames.units(1), context);
-                    pickers.to.paint(frames.units(2), context);
-                    self.core.swap.paint(frames.units(3), context);
-                }
-                _ => {}
-            }
+            self.mode_controls().paint(frames.context, context);
         }
         if self.history_only {
-            self.core.clear_history.paint(
-                Rect::new(
-                    frames.keys.origin.x + frames.keys.size.width - 120.0,
-                    frames.keys.origin.y,
-                    120.0,
-                    28.0,
-                ),
-                context,
-            );
-            Text::styled("History", TextRole::TitleSmall).paint(
-                Rect::new(
-                    frames.keys.origin.x,
-                    frames.keys.origin.y,
-                    (frames.keys.size.width - 136.0).max(0.0),
-                    28.0,
-                ),
-                context,
-            );
-            let body = Rect::new(
-                frames.keys.origin.x,
-                frames.keys.origin.y + 40.0,
-                frames.keys.size.width,
-                (frames.keys.size.height - 40.0).max(0.0),
-            );
-            context
-                .display_list
-                .push(DrawCommand::PushClip { rect: body });
-            if model.history.is_empty() {
-                Text::body("Your calculations will appear here.")
-                    .color(context.theme.colors.text_secondary)
-                    .paint(body, context);
-            }
-            let start = (model.scroll / 72.0).floor() as usize;
-            for (visual, entry) in model
-                .history
-                .iter()
-                .rev()
-                .enumerate()
-                .skip(start)
-                .take((body.size.height / 72.0).ceil() as usize + 1)
-            {
-                let index = model.history.len() - 1 - visual;
-                let frame = Rect::new(
-                    body.origin.x,
-                    body.origin.y + visual as f32 * 72.0 - model.scroll,
-                    body.size.width,
-                    64.0,
-                );
-                self.history_button(index, entry).paint(frame, context);
-            }
-            context.display_list.push(DrawCommand::PopClip);
+            Surface::pane()
+                .in_container(bounds)
+                .paint_content(frames.keys, context, |context| {
+                    self.history_content().paint(frames.keys, context);
+                });
         } else {
             let keys = self.core.keys.borrow();
             for (i, key) in keys.iter().enumerate() {
@@ -1367,18 +1305,22 @@ impl View for CalculatorView {
                     .paint(frames.key(i, keys.len(), settings.mode), context);
             }
         }
+        Toolbar::new(self.toolbar_view()).paint(frames.toolbar, context);
         let message = model
             .error
             .clone()
             .or_else(|| model.status.clone())
             .unwrap_or_default();
-        Text::caption(message)
-            .color(if model.error.is_some() {
-                context.theme.colors.destructive
-            } else {
-                context.theme.colors.text_secondary
-            })
-            .paint(frames.message, context);
+        Toolbar::bottom(
+            Text::caption(message)
+                .single_line(true)
+                .color(if model.error.is_some() {
+                    context.theme.colors.destructive
+                } else {
+                    context.theme.colors.text_secondary
+                }),
+        )
+        .paint(frames.message, context);
     }
     fn handle_event(
         &self,
@@ -1389,12 +1331,7 @@ impl View for CalculatorView {
         let mode = self.core.model.borrow().settings.mode;
         let mut frames = Frames::new(bounds, context.theme(), mode);
         if self.history_only {
-            frames.keys = Rect::new(
-                bounds.origin.x + 12.0,
-                bounds.origin.y + 48.0,
-                (bounds.size.width - 24.0).max(0.0),
-                (bounds.size.height - 84.0).max(0.0),
-            );
+            frames.keys = frames.history_area;
         }
         if let ViewEvent::ContextMenuResult {
             request_id,
@@ -1417,8 +1354,10 @@ impl View for CalculatorView {
         {
             let row = if self.history_only && frames.keys.contains(*position) {
                 let model = self.core.model.borrow();
-                let visual =
-                    ((position.y - frames.keys.origin.y - 40.0 + model.scroll) / 72.0).floor();
+                let visual = ((position.y - frames.keys.origin.y
+                    + self.core.history_scroll.offset_y())
+                    / context.theme().layout.list_row_height)
+                    .floor();
                 if visual >= 0.0 {
                     model.history.len().checked_sub(visual as usize + 1)
                 } else {
@@ -1431,6 +1370,12 @@ impl View for CalculatorView {
             return EventResult::Consumed;
         }
         if self.history_only {
+            let toolbar_result =
+                Toolbar::new(self.toolbar_view()).handle_event(frames.toolbar, event, context);
+            if toolbar_result.is_consumed() {
+                self.apply_action(&frames, context);
+                return toolbar_result;
+            }
             return self.history_event(&frames, event, context);
         }
         if mode == Mode::Convert && !self.history_only {
@@ -1492,6 +1437,12 @@ impl View for CalculatorView {
                 return EventResult::Consumed;
             }
         }
+        let toolbar_result =
+            Toolbar::new(self.toolbar_view()).handle_event(frames.toolbar, event, context);
+        if toolbar_result.is_consumed() {
+            self.apply_action(&frames, context);
+            return toolbar_result;
+        }
         let before = self.core.input.value();
         if let ViewEvent::TextInput { text } = event {
             if text == "=" {
@@ -1500,78 +1451,18 @@ impl View for CalculatorView {
                 return EventResult::Consumed;
             }
             self.prepare_input(text);
+            self.core.input.set_focused(true);
+            context.request_keyboard_focus(frames.input);
         }
         let mut result = if self.history_only {
             EventResult::Ignored
         } else {
             self.core.field.handle_event(frames.input, event, context)
         };
-        {
-            let pickers = self.core.pickers.borrow();
-            result = result.merge(pickers.mode.handle_event(
-                frames.toolbar_button(0),
-                event,
-                context,
-            ));
-            match mode {
-                Mode::Programmer => {
-                    result = result
-                        .merge(pickers.base.handle_event(
-                            Rect::new(frames.context.origin.x, frames.context.origin.y, 92.0, 28.0),
-                            event,
-                            context,
-                        ))
-                        .merge(pickers.bits.handle_event(
-                            Rect::new(
-                                frames.context.origin.x + 104.0,
-                                frames.context.origin.y,
-                                108.0,
-                                28.0,
-                            ),
-                            event,
-                            context,
-                        ))
-                        .merge(self.core.signed_control.handle_event(
-                            Rect::new(
-                                frames.context.origin.x + 224.0,
-                                frames.context.origin.y,
-                                (frames.context.size.width - 224.0).max(0.0),
-                                28.0,
-                            ),
-                            event,
-                            context,
-                        ));
-                }
-                Mode::Scientific => {
-                    result =
-                        result.merge(self.core.angle.handle_event(frames.angle(), event, context))
-                }
-                Mode::Convert => {
-                    result = result
-                        .merge(
-                            pickers
-                                .category
-                                .handle_event(frames.units(0), event, context),
-                        )
-                        .merge(pickers.from.handle_event(frames.units(1), event, context))
-                        .merge(pickers.to.handle_event(frames.units(2), event, context))
-                        .merge(self.core.swap.handle_event(frames.units(3), event, context));
-                }
-                _ => {}
-            }
-        }
-        result = result
-            .merge(
-                self.core
-                    .history
-                    .handle_event(frames.toolbar_button(1), event, context),
-            )
-            .merge(
-                self.core
-                    .default_mode
-                    .handle_event(frames.toolbar_button(2), event, context),
-            );
-        result = result.merge(self.core.copy.handle_event(frames.copy, event, context));
+        result = result.merge(
+            self.mode_controls()
+                .handle_event(frames.context, event, context),
+        );
         let keys = self.core.keys.borrow();
         for (i, key) in keys.iter().enumerate() {
             result = result.merge(key.button.handle_event(
@@ -1620,63 +1511,12 @@ impl CalculatorView {
         event: &ViewEvent,
         context: &mut EventContext<'_>,
     ) -> EventResult {
-        let mut result = EventResult::Ignored;
-        result = result.merge(self.core.clear_history.handle_event(
-            Rect::new(
-                frames.keys.origin.x + frames.keys.size.width - 120.0,
-                frames.keys.origin.y,
-                120.0,
-                28.0,
-            ),
-            event,
-            context,
-        ));
-        let body = Rect::new(
-            frames.keys.origin.x,
-            frames.keys.origin.y + 40.0,
-            frames.keys.size.width,
-            (frames.keys.size.height - 40.0).max(0.0),
-        );
-        let model = self.core.model.borrow();
-        for (visual, entry) in model
-            .history
-            .iter()
-            .rev()
-            .enumerate()
-            .skip((model.scroll / 72.0).floor() as usize)
-            .take((body.size.height / 72.0).ceil() as usize + 1)
-        {
-            let index = model.history.len() - 1 - visual;
-            let frame = Rect::new(
-                body.origin.x,
-                body.origin.y + visual as f32 * 72.0 - model.scroll,
-                body.size.width,
-                64.0,
-            );
-            let leave = ViewEvent::PointerLeft;
-            let row_event = if event.position().is_some_and(|p| !body.contains(p)) {
-                &leave
-            } else {
-                event
-            };
-            result = result.merge(
-                self.history_button(index, entry)
-                    .handle_event(frame, row_event, context),
-            );
-        }
-        let maximum = (model.history.len() as f32 * 72.0 - body.size.height).max(0.0);
-        drop(model);
-        if let ViewEvent::Scroll {
-            position, delta_y, ..
-        } = event
-        {
-            if body.contains(*position) {
-                let mut model = self.core.model.borrow_mut();
-                model.scroll = (model.scroll - *delta_y * 36.0).clamp(0.0, maximum);
-                context.request_redraw_in(body);
-                result = EventResult::Consumed;
-            }
-        }
+        let mut result = Surface::pane()
+            .in_container(frames.bounds)
+            .handle_content_event(frames.keys, event, context, |event, context| {
+                self.history_content()
+                    .handle_event(frames.keys, event, context)
+            });
         if self.core.action.get().is_some() {
             self.apply_action(frames, context);
             result = EventResult::Consumed;
@@ -1712,7 +1552,7 @@ impl CalculatorView {
         model.error = None;
         model.status = None;
     }
-    fn history_button(&self, index: usize, entry: &History) -> Button {
+    fn history_row(&self, index: usize, entry: &History) -> ListRow {
         let state = self
             .core
             .history_buttons
@@ -1721,49 +1561,28 @@ impl CalculatorView {
             .or_default()
             .clone();
         let action = self.core.action.clone();
-        Button::with_interaction_and_label(state, "")
-            .content(HistoryRow(entry.clone()))
-            .style(ButtonStyle::Ghost)
-            .accessibility_label(format!(
-                "{} = {}",
-                entry.input,
-                entry.result.display(entry.settings)
-            ))
-            .on_click(move || action.set(Some(Action::Recall(index))))
-    }
-}
-struct HistoryRow(History);
-impl View for HistoryRow {
-    fn measure(&self, c: Constraints, _: &mut MeasureContext<'_>) -> Size {
-        c.constrain(Size::new(c.maximum.width, 56.0))
-    }
-    fn paint(&self, b: Rect, c: &mut PaintContext<'_>) {
-        Text::caption(format!(
-            "{} · {}",
-            self.0.settings.mode.label(),
-            self.0.input
-        ))
-        .color(c.theme.colors.text_secondary)
-        .paint(
-            Rect::new(
-                b.origin.x + 4.0,
-                b.origin.y + 4.0,
-                (b.size.width - 8.0).max(0.0),
-                20.0,
+        ListRow::with_interaction(
+            state,
+            format!("{} = {}", entry.input, entry.result.display(entry.settings)),
+        )
+        .content(
+            Padding::all(Theme::current().list.row_padding).content(
+                VStack::new()
+                    .alignment(StackAlignment::Stretch)
+                    .gap(StackGap::ExtraSmall)
+                    .child(
+                        Text::caption(format!("{} · {}", entry.settings.mode.label(), entry.input))
+                            .single_line(true)
+                            .tone(TextTone::Secondary),
+                    )
+                    .child(
+                        Text::body_emphasized(entry.result.display(entry.settings))
+                            .single_line(true)
+                            .alignment(TextAlignment::End),
+                    ),
             ),
-            c,
-        );
-        Text::styled(self.0.result.display(self.0.settings), TextRole::TitleSmall)
-            .alignment(TextAlignment::End)
-            .paint(
-                Rect::new(
-                    b.origin.x + 4.0,
-                    b.origin.y + 28.0,
-                    (b.size.width - 8.0).max(0.0),
-                    24.0,
-                ),
-                c,
-            );
+        )
+        .on_select(move || action.set(Some(Action::Recall(index))))
     }
 }
 
@@ -1883,6 +1702,159 @@ mod tests {
         assert_eq!(f.result(), "70");
     }
     #[test]
+    fn typing_returns_to_the_expression_after_toolbar_focus() {
+        let f = Fixture::new();
+        f.view.core.input.set_focused(false);
+        f.type_text("7+8");
+        f.enter();
+        assert_eq!(f.result(), "15");
+        f.mode('2');
+        f.view.core.input.set_focused(false);
+        f.type_text("9*2");
+        f.enter();
+        assert_eq!(f.result(), "18");
+    }
+    #[test]
+    fn native_toolbar_fits_compact_windows_and_mode_menu_preserves_start_preference() {
+        for mode in Mode::ALL {
+            for width in [240.0, 280.0, 360.0, 600.0] {
+                let view = CalculatorView::with_preferences(None, mode, None);
+                let theme = Theme::LIGHT;
+                let frames = Frames::new(Rect::new(0.0, 0.0, width, 540.0), &theme, mode);
+                let mut text = TextMeasurer::new();
+                let actions = view.toolbar_view().into_visible_actions(
+                    frames.toolbar,
+                    &mut MeasureContext {
+                        theme: &theme,
+                        typography: &theme.typography,
+                        text_measurer: &mut text,
+                    },
+                );
+                assert!(actions.iter().any(|(id, _, _)| *id == ToolbarAction::Modes));
+                for (i, (_, frame, _)) in actions.iter().enumerate() {
+                    assert!(frame.origin.x >= 0.0 && frame.origin.x + frame.size.width <= width);
+                    for (_, other, _) in &actions[i + 1..] {
+                        assert!(
+                            frame.origin.x + frame.size.width <= other.origin.x
+                                || other.origin.x + other.size.width <= frame.origin.x
+                        );
+                    }
+                }
+            }
+        }
+        let f = Fixture::new();
+        f.type_text("12+3");
+        let theme = Theme::LIGHT;
+        let frames = Frames::new(Fixture::bounds(), &theme, Mode::Standard);
+        let mut text = TextMeasurer::new();
+        let mut context = EventContext::new(&theme, &theme.typography, &mut text);
+        let button = f
+            .view
+            .toolbar_view()
+            .action_bounds(
+                &ToolbarAction::Modes,
+                frames.toolbar,
+                &mut context.measure_context(),
+            )
+            .unwrap();
+        let position = Point::new(
+            button.origin.x + button.size.width / 2.0,
+            button.origin.y + button.size.height / 2.0,
+        );
+        for event in [
+            ViewEvent::PointerPressed {
+                position,
+                button: PointerButton::Primary,
+            },
+            ViewEvent::PointerReleased {
+                position,
+                button: PointerButton::Primary,
+            },
+        ] {
+            f.view.handle_event(Fixture::bounds(), &event, &mut context);
+        }
+        let menu = context.take_context_menu_request().expect("mode menu");
+        assert_eq!(menu.items.len(), 4);
+        assert!(menu.items[0].checked);
+        f.view.handle_event(
+            Fixture::bounds(),
+            &ViewEvent::ContextMenuResult {
+                request_id: menu.request_id,
+                command_id: Some(1),
+            },
+            &mut context,
+        );
+        assert_eq!(f.view.current_settings().mode, Mode::Scientific);
+        assert_eq!(f.view.core.model.borrow().start_mode, Mode::Standard);
+        f.mode('1');
+        assert_eq!(f.view.core.input.value(), "12+3");
+        f.enter();
+        assert_eq!(f.result(), "15");
+    }
+
+    #[test]
+    fn native_history_scroll_and_context_menu_keep_the_calculation_intact() {
+        let f = Fixture::new();
+        f.type_text("1+1");
+        f.enter();
+        let settings = f.view.current_settings();
+        f.view.core.model.borrow_mut().history = (0..24)
+            .map(|i| {
+                let input = format!("{i}+1");
+                History {
+                    id: i + 1,
+                    result: engine::evaluate(&input, settings, None).unwrap(),
+                    input,
+                    settings,
+                    units: (0, 0, 1),
+                }
+            })
+            .collect();
+        let input = f.view.core.input.value();
+        let result = f.result();
+        let view = f.view.history_view();
+        let theme = Theme::LIGHT;
+        let frames = Frames::new(Fixture::bounds(), &theme, Mode::Standard);
+        let mut text = TextMeasurer::new();
+        let mut commands = DisplayList::new();
+        view.paint(
+            Fixture::bounds(),
+            &mut PaintContext::new(&mut commands, &theme, &theme.typography, &mut text),
+        );
+        let mut context = EventContext::new(&theme, &theme.typography, &mut text);
+        let position = Point::new(100.0, frames.history_area.origin.y + 20.0);
+        view.handle_event(
+            Fixture::bounds(),
+            &ViewEvent::Scroll {
+                position,
+                delta_x: 0.0,
+                delta_y: 300.0,
+            },
+            &mut context,
+        );
+        let offset = f.view.core.history_scroll.offset_y();
+        assert!(offset > 0.0);
+        view.handle_event(
+            Fixture::bounds(),
+            &ViewEvent::PointerPressed {
+                position,
+                button: PointerButton::Secondary,
+            },
+            &mut context,
+        );
+        let menu = context
+            .take_context_menu_request()
+            .expect("history context menu");
+        assert_eq!(menu.items[0].label, "Copy Expression");
+        let visual = ((20.0 + offset) / theme.layout.list_row_height).floor() as usize;
+        let expected = f.view.core.model.borrow().history.len() - 1 - visual;
+        assert!(
+            matches!(f.view.core.menu.borrow()[0], Action::CopyHistory(index, false) if index == expected)
+        );
+        assert_eq!(f.view.core.input.value(), input);
+        assert_eq!(f.result(), result);
+    }
+    #[test]
     fn keyboard_errors_can_be_corrected_without_losing_input() {
         let f = Fixture::new();
         f.type_text("1/0");
@@ -1916,7 +1888,7 @@ mod tests {
         let frames = Frames::new(Fixture::bounds(), &Theme::current(), Mode::Scientific);
         let angle = frames.angle();
         f.click(Rect::new(
-            angle.origin.x + 140.0,
+            angle.origin.x + angle.size.width * 0.75,
             angle.origin.y,
             20.0,
             angle.size.height,
