@@ -20,4 +20,4 @@ resources = ["appicon.svg"]
 [[binary]]
 path = "/system/applications/Calculator.app/entry.elf"
 kind = "application"
-requires = ["ipc.client", "ipc.server", "window.create", "fs.read.user", "fs.write.user", "clipboard.read", "clipboard.write"]
+requires = ["ipc.client", "ipc.server", "window.create", "clipboard.read", "clipboard.write"]

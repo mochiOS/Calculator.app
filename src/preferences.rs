@@ -14,20 +14,7 @@ pub fn path() -> Result<PathBuf, String> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let user = std::env::var("USER").unwrap_or_else(|_| "root".into());
-        if user.is_empty()
-            || user.len() > 64
-            || !user
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
-        {
-            return Err("Invalid user name".into());
-        }
-        Ok(
-            Path::new("/libraries/applications/org.mochios.calculator/users")
-                .join(user)
-                .join("start-mode"),
-        )
+        Ok(PathBuf::from("start-mode"))
     }
 }
 pub fn load(path: &Path) -> Result<Mode, String> {
@@ -39,6 +26,17 @@ pub fn load(path: &Path) -> Result<Mode, String> {
             .ok_or_else(|| "The saved start mode is invalid; Standard mode is in use".into()),
     }
 }
+#[cfg(target_os = "mochios")]
+pub fn read_data(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
+    let key = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or("Invalid application data key")?;
+    appcore::ApplicationData::open()
+        .and_then(|data| data.read(key, limit as usize))
+        .map_err(|e| e.to_string())
+}
+#[cfg(not(target_os = "mochios"))]
 pub fn read_data(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
     let parent = path.parent().ok_or("Invalid storage path")?;
     if !parent.try_exists().map_err(|e| e.to_string())? {
@@ -66,6 +64,17 @@ pub fn read_data(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
 pub fn save(path: &Path, mode: Mode) -> Result<(), String> {
     write_data(path, format!("{}\n", mode.label()).as_bytes())
 }
+#[cfg(target_os = "mochios")]
+pub fn write_data(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let key = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or("Invalid application data key")?;
+    appcore::ApplicationData::open()
+        .and_then(|data| data.write(key, bytes))
+        .map_err(|e| e.to_string())
+}
+#[cfg(not(target_os = "mochios"))]
 pub fn write_data(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path.parent().ok_or("Invalid storage path")?;
     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -105,12 +114,15 @@ pub fn write_data(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
     Ok(())
 }
+#[cfg(not(target_os = "mochios"))]
 struct Lock(PathBuf);
+#[cfg(not(target_os = "mochios"))]
 impl Drop for Lock {
     fn drop(&mut self) {
         let _ = fs::remove_dir(&self.0);
     }
 }
+#[cfg(not(target_os = "mochios"))]
 fn remove(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -118,6 +130,7 @@ fn remove(path: &Path) -> io::Result<()> {
         Err(e) => Err(e),
     }
 }
+#[cfg(not(target_os = "mochios"))]
 fn recover(path: &Path) -> io::Result<()> {
     let previous = path.with_extension("previous");
     if previous.try_exists()? {
